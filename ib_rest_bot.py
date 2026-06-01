@@ -148,23 +148,9 @@ def check_telegram_commands(bot) -> None:
                 _send_history()
             elif text == "/politicians":
                 try:
-                    pol_trades = get_politician_trades()
-                    relevant   = {s: d for s, d in pol_trades.items()
-                                  if s in SYMBOLS and d["buys"] >= POLITICIAN_MIN_TRADES}
-                    if not relevant:
-                        send_telegram("🏛️ No politicians trading our watchlist right now.")
-                    else:
-                        lines = ""
-                        for sym, data in sorted(relevant.items(),
-                                                key=lambda x: x[1]["buys"], reverse=True):
-                            names = ", ".join(set(data["politicians"][:3]))
-                            lines += f"  📈 {sym}: {data['buys']} buys | {data['sells']} sells\n     👤 {names}\n"
-                        send_telegram(
-                            f"🏛️ Politician Trades (last {POLITICIAN_LOOKBACK_DAYS} days)\n"
-                            f"─────────────────\n{lines}"
-                            f"─────────────────\n"
-                            f"These symbols get easier entry signals 📊"
-                        )
+                    send_telegram("🔄 Building whale rankings...")
+                    send_telegram(get_leaderboard_text(top_n=10))
+                    send_telegram(get_recent_whale_activity_text())
                 except Exception as e:
                     send_telegram(f"⚠️ Politician error: {e}")
     except Exception as e:
@@ -811,14 +797,24 @@ class IBRestBot:
                 if market_open:
                     self._check_exits()
 
-                # Fetch politician trades once per scan
-                pol_trades = get_politician_trades() if POLITICIAN_MODE else {}
+                # Get whale signals (cached hourly)
+                whale_sigs = get_whale_signals(lookback_days=3) if POLITICIAN_MODE else []
+                if whale_sigs:
+                    log.info("🐋 %d whale signals from top %d politicians",
+                             len(whale_sigs), WHALE_TOP_N)
 
-                # Parallel scan with politician boost
+                # Copy whale trades directly
+                if market_open and POLITICIAN_MODE:
+                    for ws in whale_sigs:
+                        log.info("🐋 Copying whale: %s %s by %s (rank #%d)",
+                                 ws["signal"], ws["symbol"], ws["politician"], ws["rank"])
+                        self._try_entry(ws["symbol"], ws["signal"])
+
+                # Parallel scan with whale boost
                 raw_signals = {}
                 def scan_sym(sym):
                     try:
-                        pol_adj = get_politician_signal(sym, pol_trades)
+                        pol_adj = get_politician_signal(sym, whale_sigs)
                         return sym, get_signal(sym, rsi_adj=pol_adj)
                     except Exception:
                         return sym, None
