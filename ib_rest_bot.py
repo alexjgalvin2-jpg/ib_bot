@@ -18,6 +18,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from whale_tracker import (
+    get_whale_rankings, get_whale_signals,
+    get_leaderboard_text, get_recent_whale_activity_text,
+    WHALE_TOP_N
+)
 
 # Suppress SSL warnings for localhost gateway
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -63,10 +68,26 @@ SIGNAL_MODE   = "all"
 STRADDLE_MODE = True
 PARALLEL_SCAN = True
 
+# Trailing Stop
+TRAIL_ACTIVATE_PCT = 10.0
+TRAIL_DISTANCE_PCT = 8.0
+
+# Laddering
+LADDER_MODE     = True
+LADDER_TRANCHES = 3
+LADDER_SIZES    = [0.5, 0.3, 0.2]
+LADDER_TRIGGER  = 5.0
+
+# Politician Tracking
+POLITICIAN_MODE         = True
+POLITICIAN_BOOST_RSI    = 3
+POLITICIAN_LOOKBACK_DAYS = 30
+POLITICIAN_MIN_TRADES   = 2
+
 # SpaceX IPO Straddle
 SPACEX_MODE     = True
 SPACEX_SYMBOLS  = ["RKLB", "ASTS", "BA", "LMT", "ARKK"]
-SPACEX_IPO_DATE = "2026-12-01"  # update when confirmed
+SPACEX_IPO_DATE = "2026-12-01"
 
 SYMBOLS = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
@@ -125,6 +146,27 @@ def check_telegram_commands(bot) -> None:
                 _send_report(bot)
             elif text == "/accounthistory":
                 _send_history()
+            elif text == "/politicians":
+                try:
+                    pol_trades = get_politician_trades()
+                    relevant   = {s: d for s, d in pol_trades.items()
+                                  if s in SYMBOLS and d["buys"] >= POLITICIAN_MIN_TRADES}
+                    if not relevant:
+                        send_telegram("🏛️ No politicians trading our watchlist right now.")
+                    else:
+                        lines = ""
+                        for sym, data in sorted(relevant.items(),
+                                                key=lambda x: x[1]["buys"], reverse=True):
+                            names = ", ".join(set(data["politicians"][:3]))
+                            lines += f"  📈 {sym}: {data['buys']} buys | {data['sells']} sells\n     👤 {names}\n"
+                        send_telegram(
+                            f"🏛️ Politician Trades (last {POLITICIAN_LOOKBACK_DAYS} days)\n"
+                            f"─────────────────\n{lines}"
+                            f"─────────────────\n"
+                            f"These symbols get easier entry signals 📊"
+                        )
+                except Exception as e:
+                    send_telegram(f"⚠️ Politician error: {e}")
     except Exception as e:
         log.debug("check_telegram_commands failed: %s", e)
 
@@ -396,6 +438,20 @@ def log_trade(entry: dict):
 
 
 # =============================================================================
+#  POLITICIAN WHALE INTEGRATION
+# =============================================================================
+def get_politician_signal(symbol: str, whale_signals: list) -> int:
+    """Returns RSI adjustment based on top whale activity on this symbol."""
+    for sig in whale_signals:
+        if sig["symbol"] == symbol:
+            if sig["signal"] == "CALL":
+                return -POLITICIAN_BOOST_RSI  # easier entry
+            elif sig["signal"] == "PUT":
+                return POLITICIAN_BOOST_RSI   # harder entry
+    return 0
+
+
+# =============================================================================
 #  MAIN BOT
 # =============================================================================
 class IBRestBot:
@@ -456,8 +512,10 @@ class IBRestBot:
         return False
 
     def _check_exits(self):
-        positions = self.state.get("positions", {})
-        to_close  = []
+        positions   = self.state.get("positions", {})
+        to_close    = []
+        state_dirty = False
+
         for key, pos in list(positions.items()):
             try:
                 right   = "C" if pos["option_type"] == "CALL" else "P"
@@ -474,12 +532,49 @@ class IBRestBot:
                     continue
                 entry   = pos["entry_price"]
                 pnl_pct = (price - entry) / entry * 100
+
+                # Trailing stop
+                highest_pnl = pos.get("highest_pnl_pct", pnl_pct)
+                if pnl_pct > highest_pnl:
+                    pos["highest_pnl_pct"] = pnl_pct
+                    highest_pnl = pnl_pct
+                    state_dirty = True
+
+                if highest_pnl >= TRAIL_ACTIVATE_PCT:
+                    trail_stop = highest_pnl - TRAIL_DISTANCE_PCT
+                    if pnl_pct <= trail_stop:
+                        to_close.append((key, pos, price, pnl_pct,
+                                         f"TRAILING STOP 🔒 (peak: +{highest_pnl:.1f}%)"))
+                        continue
+
+                # Ladder scaling
+                if LADDER_MODE:
+                    tranche = pos.get("ladder_tranche", 1)
+                    if tranche < LADDER_TRANCHES and pnl_pct >= LADDER_TRIGGER * tranche:
+                        next_t  = tranche + 1
+                        budget  = MAX_PREMIUM * LADDER_SIZES[next_t - 1]
+                        add_qty = max(1, int(budget / (price * 100)))
+                        result  = self.client.place_order(0, "BUY", add_qty)
+                        if result:
+                            pos["quantity"]        += add_qty
+                            pos["ladder_tranche"]   = next_t
+                            state_dirty = True
+                            send_telegram(
+                                f"📊 IB LADDER TRANCHE {next_t}/{LADDER_TRANCHES}\n"
+                                f"Symbol: {pos['symbol']} {pos['option_type']}\n"
+                                f"Added {add_qty} contract(s)\n"
+                                f"Position up {pnl_pct:.1f}% — scaling in ✅"
+                            )
+
                 if pnl_pct >= TAKE_PROFIT_PCT:
                     to_close.append((key, pos, price, pnl_pct, "TAKE PROFIT ✅"))
                 elif pnl_pct <= -STOP_LOSS_PCT:
                     to_close.append((key, pos, price, pnl_pct, "STOP LOSS ❌"))
             except Exception as e:
                 log.warning("Exit check %s: %s", key, e)
+
+        if state_dirty:
+            save_state(self.state)
 
         for key, pos, price, pnl_pct, reason in to_close:
             pnl_usd = (price - pos["entry_price"]) * pos["quantity"] * 100
@@ -716,11 +811,15 @@ class IBRestBot:
                 if market_open:
                     self._check_exits()
 
-                # Parallel scan
+                # Fetch politician trades once per scan
+                pol_trades = get_politician_trades() if POLITICIAN_MODE else {}
+
+                # Parallel scan with politician boost
                 raw_signals = {}
                 def scan_sym(sym):
                     try:
-                        return sym, get_signal(sym)
+                        pol_adj = get_politician_signal(sym, pol_trades)
+                        return sym, get_signal(sym, rsi_adj=pol_adj)
                     except Exception:
                         return sym, None
 
