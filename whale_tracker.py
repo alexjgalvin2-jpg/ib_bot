@@ -32,9 +32,9 @@ RANKINGS_FILE         = os.path.join(DATA_DIR, "whale_rankings.json")
 TRADES_CACHE_FILE     = os.path.join(DATA_DIR, "politician_trades_cache.json")
 
 WHALE_TOP_N           = 5      # copy trades from top N politicians
-WHALE_MIN_TRADES      = 5      # minimum trades needed to qualify for ranking
+WHALE_MIN_TRADES      = 3      # lowered from 5 — qualify with fewer trades
 WHALE_LOOKBACK_DAYS   = 365    # score trades from last 12 months
-WHALE_RETURN_DAYS     = 30     # measure stock return 30 days after trade
+WHALE_RETURN_DAYS     = 14     # lowered from 30 — check price after 14 days
 WHALE_CACHE_TTL       = 3600   # refresh trade data every hour
 RANKINGS_REFRESH_DAYS = 1      # re-score whales every day
 
@@ -77,32 +77,44 @@ def fetch_house_trades() -> list:
 
 
 def fetch_senate_trades() -> list:
-    """Senate trades from senatestockwatcher.com."""
-    try:
-        url  = "https://senatestockwatcher.com/api"
-        resp = requests.get(url, timeout=20,
-                            headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        data = resp.json()
-        trades = []
-        for t in data:
-            ticker = (t.get("ticker") or "").strip().upper()
-            if not ticker or ticker in ("--", "N/A", ""):
+    """Senate trades — tries multiple known endpoints."""
+    endpoints = [
+        "https://senatestockwatcher.com/api",
+        "https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json",
+    ]
+    for url in endpoints:
+        try:
+            resp = requests.get(url, timeout=20,
+                                headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code != 200:
                 continue
-            trades.append({
-                "politician": t.get("senator", "Unknown"),
-                "chamber":    "Senate",
-                "ticker":     ticker,
-                "tx_date":    t.get("transaction_date", "")[:10],
-                "tx_type":    t.get("type", "").lower(),
-                "amount":     t.get("amount", ""),
-                "source":     "senatestockwatcher",
-            })
-        log.info("Senate trades fetched: %d records", len(trades))
-        return trades
-    except Exception as e:
-        log.warning("fetch_senate_trades failed: %s", e)
-        return []
+            data = resp.json()
+            if not data:
+                continue
+            trades = []
+            for t in (data if isinstance(data, list) else []):
+                ticker = (t.get("ticker") or t.get("asset_description") or "").strip().upper()
+                # Clean up ticker — remove spaces and options notation
+                ticker = ticker.split()[0] if ticker else ""
+                if not ticker or len(ticker) > 5 or ticker in ("--", "N/A", ""):
+                    continue
+                trades.append({
+                    "politician": t.get("senator") or t.get("first_name", "") + " " + t.get("last_name", ""),
+                    "chamber":    "Senate",
+                    "ticker":     ticker,
+                    "tx_date":    (t.get("transaction_date") or t.get("disclosure_date") or "")[:10],
+                    "tx_type":    (t.get("type") or t.get("transaction_type") or "").lower(),
+                    "amount":     t.get("amount", ""),
+                    "source":     "senatestockwatcher",
+                })
+            if trades:
+                log.info("Senate trades fetched: %d records from %s", len(trades), url)
+                return trades
+        except Exception as e:
+            log.debug("Senate endpoint %s failed: %s", url, e)
+            continue
+    log.warning("All Senate endpoints failed")
+    return []
 
 
 def fetch_capitol_trades() -> list:
@@ -295,6 +307,16 @@ def build_whale_rankings(all_trades: list) -> list:
     Returns list sorted by profitability (best first).
     """
     log.info("Building whale rankings from %d trades...", len(all_trades))
+    if not all_trades:
+        log.warning("No trades to rank — check data sources")
+        return []
+
+    # Show sample of what we have
+    sample = all_trades[:3]
+    for s in sample:
+        log.info("Sample trade: %s | %s | %s | %s",
+                 s.get("politician"), s.get("ticker"),
+                 s.get("tx_date"), s.get("tx_type"))
 
     # Group trades by politician
     by_politician = {}
