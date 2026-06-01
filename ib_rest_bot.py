@@ -23,6 +23,10 @@ from whale_tracker import (
     get_leaderboard_text, get_recent_whale_activity_text,
     WHALE_TOP_N
 )
+from risk_filters import (
+    passes_all_filters, vix_premium_multiplier,
+    vix_status_text, sector_exposure_text
+)
 
 # Suppress SSL warnings for localhost gateway
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -608,6 +612,12 @@ class IBRestBot:
         if len(positions) >= MAX_POSITIONS:
             return
 
+        # ── Risk Filters ──────────────────────────────────────────────────────
+        passed, reason = passes_all_filters(symbol, positions)
+        if not passed:
+            log.info("❌ Risk filter blocked %s: %s", symbol, reason)
+            return
+
         # Get spot price
         try:
             tkr   = yf.Ticker(symbol)
@@ -627,7 +637,11 @@ class IBRestBot:
         if not ask or ask <= 0:
             return
 
-        quantity = max(1, int(MAX_PREMIUM / (ask * 100)))
+        adj_premium = MAX_PREMIUM * vix_premium_multiplier()
+        if adj_premium <= 0:
+            log.info("VIX too high — skipping %s %s", symbol, signal)
+            return
+        quantity = max(1, int(adj_premium / (ask * 100)))
         cost     = ask * quantity * 100
 
         # Paper mode — log without real order
