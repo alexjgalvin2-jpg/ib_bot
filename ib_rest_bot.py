@@ -59,9 +59,14 @@ RSI_BULL    = 55
 RSI_BEAR    = 45
 SMA_PERIOD  = 20
 VOLUME_MULT = 1.3
-SIGNAL_MODE = "all"
+SIGNAL_MODE   = "all"
 STRADDLE_MODE = True
 PARALLEL_SCAN = True
+
+# SpaceX IPO Straddle
+SPACEX_MODE     = True
+SPACEX_SYMBOLS  = ["RKLB", "ASTS", "BA", "LMT", "ARKK"]
+SPACEX_IPO_DATE = "2026-12-01"  # update when confirmed
 
 SYMBOLS = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
@@ -584,6 +589,35 @@ class IBRestBot:
         self.daily_trades.append(entry)
         log.info("Entered %s %s strike=%.0f @ $%.2f x%d", signal, symbol, strike, ask, quantity)
 
+    def _run_spacex_straddle(self):
+        """Enter straddles on SpaceX proxy stocks around IPO date."""
+        try:
+            ipo_date  = datetime.strptime(SPACEX_IPO_DATE, "%Y-%m-%d").date()
+            today     = date.today()
+            days_away = (ipo_date - today).days
+            if not (0 <= days_away <= 14):
+                return
+            log.info("🚀 SpaceX IPO in %d days — checking straddle positions", days_away)
+            spacex_positions = self.state.get("spacex_positions", {})
+            for symbol in SPACEX_SYMBOLS:
+                if symbol in spacex_positions:
+                    continue
+                self._try_entry(symbol, "CALL")
+                self._try_entry(symbol, "PUT")
+                self.state.setdefault("spacex_positions", {})[symbol] = {
+                    "timestamp": datetime.now().isoformat()
+                }
+                save_state(self.state)
+            if any(s not in spacex_positions for s in SPACEX_SYMBOLS):
+                send_telegram(
+                    f"🚀 SpaceX IPO Straddle — IB\n"
+                    f"IPO in {days_away} days ({SPACEX_IPO_DATE})\n"
+                    f"Entering straddles: {', '.join(SPACEX_SYMBOLS)}\n"
+                    f"Profit whether SpaceX goes UP or DOWN 📈📉"
+                )
+        except Exception as e:
+            log.warning("SpaceX straddle failed: %s", e)
+
     def _daily_summary(self):
         positions  = self.state.get("positions", {})
         all_trades = _load_trades()
@@ -721,6 +755,10 @@ class IBRestBot:
                             f"Total queued: {len(self.signal_queue)}\n"
                             f"Fires at 9:30 AM ET"
                         )
+
+                # SpaceX IPO straddle check
+                if SPACEX_MODE:
+                    self._run_spacex_straddle()
 
                 # Daily summary at 4 PM
                 if (now.hour == DAILY_SUMMARY_HOUR and
